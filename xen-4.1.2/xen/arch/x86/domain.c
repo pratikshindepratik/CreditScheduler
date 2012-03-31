@@ -54,6 +54,7 @@
 #include <asm/mce.h>
 #include <xen/numa.h>
 #include <xen/iommu.h>
+#include <public/event_channel.h>
 #ifdef CONFIG_COMPAT
 #include <compat/vcpu.h>
 #endif
@@ -399,6 +400,7 @@ int vcpu_initialise(struct vcpu *v)
     {
         v->arch.schedule_tail = continue_idle_domain;
         v->arch.cr3           = __pa(idle_pg_table);
+        printk("\nThis domain is idle for %lu time",NOW());
     }
 
     v->arch.guest_context.ctrlreg[4] =
@@ -922,7 +924,7 @@ map_vcpu_info(struct vcpu *v, unsigned long mfn, unsigned offset)
     void *mapping;
     vcpu_info_t *new_info;
     int i;
-
+    
     if ( offset > (PAGE_SIZE - sizeof(vcpu_info_t)) )
         return -EINVAL;
 
@@ -1096,7 +1098,7 @@ arch_do_vcpu_op(
 
 /*
  * save_segments() writes a mask of segments which are dirty (non-zero),
- * allowing load_segments() to avoid some expensive segment loads and
+ * allowing load_segments() to avoid some expensive __copy_to_guestsegment loads and
  * MSR writes.
  */
 static DEFINE_PER_CPU(unsigned int, dirty_segment_mask);
@@ -1316,6 +1318,7 @@ static void save_segments(struct vcpu *v)
 static inline void switch_kernel_stack(struct vcpu *v)
 {
     struct tss_struct *tss = &this_cpu(init_tss);
+    unsigned int r;
     tss->esp1 = v->arch.guest_context.kernel_sp;
     tss->ss1  = v->arch.guest_context.kernel_ss;
 }
@@ -1469,7 +1472,6 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
 {
     unsigned int cpu = smp_processor_id();
     cpumask_t dirty_mask = next->vcpu_dirty_cpumask;
-
     ASSERT(local_irq_is_enabled());
 
     /* Allow at most one CPU at a time to be dirty. */
@@ -2075,11 +2077,48 @@ void vcpu_kick(struct vcpu *v)
     if ( running && (in_irq() || (v != current)) )
         cpu_raise_softirq(v->processor, VCPU_KICK_SOFTIRQ);
 }
-
+#define THRESHOLD 6000000
 void vcpu_mark_events_pending(struct vcpu *v)
 {
-    int already_pending = test_and_set_bit(
-        0, (unsigned long *)&vcpu_info(v, evtchn_upcall_pending));
+   
+    unsigned long int pendingvcpu=0;
+    struct domain *d=v->domain;
+   
+    
+  int i;
+  
+    int already_pending = test_and_set_bit(0, (unsigned long *)&vcpu_info(v, evtchn_upcall_pending));
+    /*KAPS Entry*/
+    int conc_vcpu_count=0;
+    pendingvcpu=v->vcpu_pending;
+    v->vcpu_pending=NOW();
+    v->diff=NOW()-pendingvcpu;
+    if(v->diff<THRESHOLD){
+             for(i=0;i<d->max_vcpus;i++){
+                    printk("\n(%d)VCPU is :%d of domain:%d diff:%lu",i,d->vcpu[i]->vcpu_id,d->domain_id,d->vcpu[i]->diff);
+                   if(d->vcpu[i]->diff>THRESHOLD)
+                   {
+                    conc_vcpu_count++;
+                    d->vcpu[i]->is_conc=1;
+                   }
+                   else
+                    d->vcpu[i]->is_conc=0;
+              }
+          if(conc_vcpu_count>=2)
+          {
+          d->DOC=1;
+          printk("\nDOC is 1 Distribute");
+          } 
+         else
+          {
+          d->DOC=0;
+          printk("\nDOC is 0 Don't  distrubute");
+          }
+  }             
+                      
+          
+      
+
 
     if ( already_pending )
         return;
@@ -2089,7 +2128,10 @@ void vcpu_mark_events_pending(struct vcpu *v)
     else
         vcpu_kick(v);
 }
+/*
+ function*/
 
+/*KAPS end*/
 static void vcpu_kick_softirq(void)
 {
     /*

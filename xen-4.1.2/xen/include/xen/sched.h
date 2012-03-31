@@ -98,12 +98,14 @@ struct vcpu
     s_time_t         periodic_last_event;
     struct timer     periodic_timer;
     struct timer     singleshot_timer;
-
     struct timer     poll_timer;    /* timeout for SCHEDOP_poll */
 
     void            *sched_priv;    /* scheduler-specific data */
 
+   bool_t is_conc;//KAPS
     struct vcpu_runstate_info runstate;
+    unsigned long vcpu_pending;/*KAPS addition*/
+    unsigned long diff;/*KAPS*/
 #ifndef CONFIG_COMPAT
 # define runstate_guest(v) ((v)->runstate_guest)
     XEN_GUEST_HANDLE(vcpu_runstate_info_t) runstate_guest; /* guest address */
@@ -218,6 +220,7 @@ struct domain
 
     unsigned int     max_vcpus;
 
+    bool_t DOC;//KAPS
     /* Scheduling. */
     void            *sched_priv;    /* scheduler-specific data */
     struct cpupool  *cpupool;

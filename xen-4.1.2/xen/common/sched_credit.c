@@ -311,7 +311,7 @@ __runq_tickle(unsigned int cpu, struct csched_vcpu *new)
 
     /* Send scheduler interrupts to designated CPUs */
     if ( !cpus_empty(mask) )
-        cpumask_raise_softirq(mask, SCHEDULE_SOFTIRQ);
+        cpumask_raise_softirq(mask, SCHEDULE_SOFTIRQ); //KAPS
 }
 
 static void
@@ -462,8 +462,9 @@ static int
 _csched_cpu_pick(const struct scheduler *ops, struct vcpu *vc, bool_t commit)
 {
     cpumask_t cpus;
-    cpumask_t idlers;
+    cpumask_t idlers,cpus_avoid_same_domain;
     cpumask_t *online;
+    struct vcpu *vp;
     int cpu;
 
     /*
@@ -472,6 +473,19 @@ _csched_cpu_pick(const struct scheduler *ops, struct vcpu *vc, bool_t commit)
      */
     online = CSCHED_CPUONLINE(vc->domain->cpupool);
     cpus_and(cpus, *online, vc->cpu_affinity);
+        /*KAP patch
+      Avoid putting vcpus from the same domain on the same cpu*/ 
+    cpus_avoid_same_domain=cpus;
+    for_each_vcpu( vc->domain, vp )
+    {
+        if(vp == vc)
+            continue;
+        cpu_clear(vp->processor, cpus_avoid_same_domain);
+    }
+
+    if( !cpus_empty(cpus_avoid_same_domain) )
+        cpus = cpus_avoid_same_domain;
+   /* KAPS end*/
     cpu = cpu_isset(vc->processor, cpus)
             ? vc->processor
             : cycle_cpu(vc->processor, cpus);
@@ -856,7 +870,8 @@ static int
 csched_dom_init(const struct scheduler *ops, struct domain *dom)
 {
     struct csched_dom *sdom;
-
+   
+	dom->DOC=0;//KAPS
     CSCHED_STAT_CRANK(dom_init);
 
     if ( is_idle_domain(dom) )
@@ -865,9 +880,8 @@ csched_dom_init(const struct scheduler *ops, struct domain *dom)
     sdom = csched_alloc_domdata(ops, dom);
     if ( sdom == NULL )
         return -ENOMEM;
-
+	
     dom->sched_priv = sdom;
-
     return 0;
 }
 
@@ -880,6 +894,7 @@ csched_free_domdata(const struct scheduler *ops, void *data)
 static void
 csched_dom_destroy(const struct scheduler *ops, struct domain *dom)
 {
+    
     CSCHED_STAT_CRANK(dom_destroy);
     csched_free_domdata(ops, CSCHED_DOM(dom));
 }
@@ -1169,7 +1184,52 @@ csched_tick(void *_cpu)
 
     set_timer(&spc->ticker, NOW() + MILLISECS(CSCHED_MSECS_PER_TICK));
 }
+/*KAPS : function*/
+static void
+csched_distribute_domain_vcpus(int cpu, struct domain * ddom)
+{
+    const struct csched_pcpu * const pcpu = CSCHED_PCPU(cpu);
+    struct csched_vcpu *sp;
+    struct list_head * iter, *n;
 
+    list_for_each_safe( iter, n, &pcpu->runq )
+    {
+        sp = __runq_elem(iter);
+        if( ( sp->vcpu->domain == ddom ) && vcpu_runnable(sp->vcpu) ) {
+            
+            /* There is a short period of time, between the beginning
+             * of csched_schedule() and context_switch(), where the
+             * currently running vcpu (aka prev in schedule.c) is on
+             * the runqueue, and the newly chosen vcpu (next) is off
+             * the runqueue but not yet running.  Scheduling the
+             * running vcpu on another cpu before it's context
+             * switched out is disastrous.
+             *
+             * Instead we set the migrating bit.  This is checked
+             * after context_switch() occurs.  vcpu_migrate will
+             * call cpu_pick() to choose another cpu at that time. */
+             
+            if( sp->vcpu->is_running )
+            {
+                __runq_remove(sp);
+                set_bit(_VPF_migrating, &sp->vcpu->pause_flags);
+            }
+            else 
+            {
+                const struct scheduler *ops = per_cpu(scheduler, cpu);
+                int peer_cpu = csched_cpu_pick(ops,sp->vcpu);
+                if ( spin_trylock(per_cpu(schedule_data, peer_cpu).schedule_lock) )
+                {
+                    __runq_remove(sp);
+                    sp->vcpu->processor = peer_cpu;
+                    csched_vcpu_wake(ops,sp->vcpu);
+                    spin_unlock(per_cpu(schedule_data, peer_cpu).schedule_lock);
+                } 
+            }
+        }
+    }
+}
+/*KAPS function end*/
 static struct csched_vcpu *
 csched_runq_steal(int peer_cpu, int cpu, int pri)
 {
@@ -1178,7 +1238,7 @@ csched_runq_steal(int peer_cpu, int cpu, int pri)
     struct csched_vcpu *speer;
     struct list_head *iter;
     struct vcpu *vc;
-
+   // printk("KAPS stealing");
     /*
      * Don't steal from an idle CPU's runq because it's about to
      * pick up work from it itself.
@@ -1299,10 +1359,8 @@ csched_schedule(
     struct csched_private *prv = CSCHED_PRIV(ops);
     struct csched_vcpu *snext;
     struct task_slice ret;
-
     CSCHED_STAT_CRANK(schedule);
     CSCHED_VCPU_CHECK(current);
-
     if ( !is_idle_vcpu(scurr->vcpu) )
     {
         /* Update credits of a non-idle VCPU. */
@@ -1369,6 +1427,16 @@ csched_schedule(
     if ( !is_idle_vcpu(snext->vcpu) )
         snext->start_time += now;
 
+   /* KAPS start
+    
+     * Distrubute vcpus from the same domain from this
+     * runqueue to others*/
+     
+    if( !is_idle_vcpu(snext->vcpu) && snext->vcpu->domain->DOC)
+      {
+        csched_distribute_domain_vcpus(cpu, snext->vcpu->domain);
+      }
+    /*KAPS End*/
     /*
      * Return task to run next...
      */
@@ -1505,13 +1573,12 @@ csched_dump(const struct scheduler *ops)
 
 static int
 csched_init(struct scheduler *ops)
-{
+{   
     struct csched_private *prv;
-
     prv = xmalloc(struct csched_private);
     if ( prv == NULL )
         return -ENOMEM;
-
+   
     memset(prv, 0, sizeof(*prv));
     ops->sched_data = prv;
     spin_lock_init(&prv->lock);
@@ -1588,3 +1655,12 @@ const struct scheduler sched_credit_def = {
     .tick_suspend   = csched_tick_suspend,
     .tick_resume    = csched_tick_resume,
 };
+/*
++ * Local variables:
++ * mode: C
++ * c-set-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
